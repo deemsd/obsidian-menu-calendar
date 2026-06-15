@@ -1,4 +1,3 @@
-<img width="1920" height="1080" alt="截屏2026-06-15 17 22 03" src="https://github.com/user-attachments/assets/0fa59f1c-7c2b-440e-b41d-fcb03529dc01" />
 # Menu Calendar
 
 Author: deemsd
@@ -6,6 +5,8 @@ Author: deemsd
 Menu Calendar is a small macOS menu bar calendar made for Obsidian daily notes. It shows the tasks from your Daily Notes, lets you add, edit, delete, and check off tasks directly from the menu bar, then writes everything back to your Markdown files.
 
 Menu Calendar 是一个给 Obsidian 每日笔记用的 macOS 状态栏小日历。点开状态栏就能看到每日任务，也可以直接新增、编辑、删除、勾选完成，所有改动都会同步回你的 Markdown 文件。
+<img width="553" height="723" alt="截屏2026-06-15 17 23 38" src="https://github.com/user-attachments/assets/43274ad2-a3f3-4942-9868-ef36427e4214" />
+
 
 ## Features / 功能
 
