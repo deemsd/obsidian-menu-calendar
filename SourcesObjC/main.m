@@ -2205,6 +2205,9 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 @property (nonatomic, strong) id outsideClickMonitor;
 @property (nonatomic, strong) id keyboardMonitor;
 @property (nonatomic, assign) BOOL allowingPopoverClose;
+@property (nonatomic, assign) BOOL dataLoaded;
+@property (nonatomic, assign) BOOL dataDirty;
+@property (nonatomic, copy) NSString *loadedDayKey;
 @end
 
 @implementation OMCAppDelegate
@@ -2219,6 +2222,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     self.watchSources = [NSMutableArray array];
     self.watchFDs = [NSMutableArray array];
     self.showingSettings = !self.config.hasVault;
+    self.dataDirty = YES;
 
     [self setupStatusItem];
     [self setupPopover];
@@ -2264,7 +2268,12 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
         [self closePopover];
         return;
     }
-    [self reloadDataAndRender];
+    NSString *todayKey = OMCCanonicalDateKey([NSDate date]);
+    if (!self.dataLoaded || self.dataDirty || ![self.loadedDayKey isEqualToString:todayKey]) {
+        [self reloadDataAndRender];
+    } else {
+        [self renderPopoverContent];
+    }
     [self positionCalendarPanel];
     [NSApp activateIgnoringOtherApps:YES];
     [self.calendarPanel makeKeyAndOrderFront:nil];
@@ -2637,6 +2646,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
         NSNumber *isDir = nil;
         [url getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
         if (isDir.boolValue) {
+            [watchPaths addObject:url.path];
             NSString *name = url.lastPathComponent;
             if ([name isEqualToString:@".obsidian"] || [name isEqualToString:@".trash"] || [name isEqualToString:@"附件"] || [name.lowercaseString isEqualToString:@"attachments"]) {
                 [enumerator skipDescendants];
@@ -2694,6 +2704,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
             NSNumber *isDir = nil;
             [url getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
             if (isDir.boolValue) {
+                [watchPaths addObject:url.path];
                 NSString *name = url.lastPathComponent;
                 if ([name isEqualToString:@".obsidian"] || [name isEqualToString:@".trash"] || [name isEqualToString:@"附件"] || [name.lowercaseString isEqualToString:@"attachments"]) {
                     [enumerator skipDescendants];
@@ -2735,6 +2746,9 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
         [self stopWatching];
         [self updateStatusItemTitle];
         [self renderPopoverContent];
+        self.dataLoaded = YES;
+        self.dataDirty = NO;
+        self.loadedDayKey = OMCCanonicalDateKey([NSDate date]);
         return;
     }
 
@@ -2745,6 +2759,9 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
         [self stopWatching];
         [self updateStatusItemTitle];
         [self renderPopoverContent];
+        self.dataLoaded = YES;
+        self.dataDirty = NO;
+        self.loadedDayKey = OMCCanonicalDateKey([NSDate date]);
         return;
     }
     [watchPaths addObject:dailyPath];
@@ -2799,6 +2816,9 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     [self startWatchingPaths:watchPaths.allObjects];
     [self updateStatusItemTitle];
     [self renderPopoverContent];
+    self.dataLoaded = YES;
+    self.dataDirty = NO;
+    self.loadedDayKey = OMCCanonicalDateKey([NSDate date]);
 }
 
 - (void)renderPopoverContent {
@@ -2958,15 +2978,34 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     CGFloat cursor = 0;
     NSArray<OMCTask *> *selectedOpenTasks = [self tasksForDate:self.selectedDate done:NO];
     NSArray<OMCTask *> *selectedDoneTasks = [self tasksForDate:self.selectedDate done:YES];
-    cursor = [self addTaskSectionToView:document title:[OMCCalendar() isDateInToday:self.selectedDate] ? @"今天" : OMCShortDate(self.selectedDate) empty:@"这天还没有任务" tasks:selectedOpenTasks y:cursor showsDate:NO allowsAdd:YES highlightsOverdue:NO];
-    if (selectedDoneTasks.count > 0) {
-        cursor = [self addTaskSectionToView:document title:@"已完成" empty:@"" tasks:selectedDoneTasks y:cursor showsDate:NO allowsAdd:NO highlightsOverdue:NO];
-    }
+    NSString *selectedTitle = [OMCCalendar() isDateInToday:self.selectedDate] ? @"今天" : OMCShortDate(self.selectedDate);
+    NSTextField *titleLabel = [self labelWithText:selectedTitle
+                                            frame:NSMakeRect(14, cursor + 10, OMCWidth - 28, 16)
+                                             font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
+                                            color:[OMCSecondaryTextColor() colorWithAlphaComponent:0.95]];
+    [document addSubview:titleLabel];
+
+    OMCChromeButton *copy = [self chromeButtonWithTitle:@"⧉" frame:NSMakeRect(OMCWidth - 32, cursor + 7, 20, 20) pill:NO action:@selector(copySelectedDateTasks:)];
+    copy.labelSize = 14;
+    copy.labelColor = [OMCSecondaryTextColor() colorWithAlphaComponent:0.62];
+    [document addSubview:copy];
+
+    cursor += 34;
+    [self addInlineTaskInputToView:document y:cursor];
+    cursor += 40;
+
     NSArray<OMCTask *> *overdueTasks = [self overdueTasks];
     if (overdueTasks.count > 0) {
+        cursor = [self addTaskSectionToView:document title:@"已过期" empty:@"" tasks:overdueTasks y:cursor showsDate:YES allowsAdd:NO highlightsOverdue:YES];
         [self addDividerToView:document y:cursor + 4];
         cursor += 12;
-        cursor = [self addTaskSectionToView:document title:@"已过期" empty:@"" tasks:overdueTasks y:cursor showsDate:YES allowsAdd:NO highlightsOverdue:YES];
+    }
+    for (OMCTask *task in selectedOpenTasks) {
+        [self addTaskRowToView:document task:task y:cursor showsDate:NO highlightsOverdue:NO];
+        cursor += 58;
+    }
+    if (selectedDoneTasks.count > 0) {
+        cursor = [self addTaskSectionToView:document title:@"已完成" empty:@"" tasks:selectedDoneTasks y:cursor showsDate:NO allowsAdd:NO highlightsOverdue:NO];
     }
     [self addDividerToView:document y:cursor + 4];
     cursor += 12;
@@ -3274,20 +3313,32 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 
 - (void)goToToday:(id)sender {
     self.selectedDate = OMCStartOfDay([NSDate date]);
-    self.visibleMonth = [self monthStartForDate:self.selectedDate];
+    NSDate *targetMonth = [self monthStartForDate:self.selectedDate];
+    BOOL monthChanged = ![OMCCalendar() isDate:targetMonth equalToDate:self.visibleMonth toUnitGranularity:NSCalendarUnitMonth];
+    self.visibleMonth = targetMonth;
     self.inlineDraftText = @"";
     self.inlineInputActive = NO;
-    [self reloadDataAndRender];
+    if (monthChanged || self.dataDirty || !self.dataLoaded) {
+        [self reloadDataAndRender];
+    } else {
+        [self renderPopoverContent];
+    }
 }
 
 - (void)selectDay:(OMCDayCell *)sender {
     self.selectedDate = OMCStartOfDay(sender.date);
+    BOOL monthChanged = NO;
     if (![OMCCalendar() isDate:self.selectedDate equalToDate:self.visibleMonth toUnitGranularity:NSCalendarUnitMonth]) {
         self.visibleMonth = [self monthStartForDate:self.selectedDate];
+        monthChanged = YES;
     }
     self.inlineDraftText = @"";
     self.inlineInputActive = NO;
-    [self reloadDataAndRender];
+    if (monthChanged || self.dataDirty || !self.dataLoaded) {
+        [self reloadDataAndRender];
+    } else {
+        [self renderPopoverContent];
+    }
 }
 
 - (OMCTask *)taskForIdentifier:(NSString *)identifier {
@@ -3718,6 +3769,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 }
 
 - (void)scheduleReload {
+    self.dataDirty = YES;
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(reloadDataAndRender) object:nil];
     [self performSelector:@selector(reloadDataAndRender) withObject:nil afterDelay:0.35];
 }
