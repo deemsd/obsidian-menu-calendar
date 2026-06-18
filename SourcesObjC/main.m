@@ -9,6 +9,7 @@
 static CGFloat const OMCWidth = 310.0;
 static CGFloat const OMCHeight = 640.0;
 static NSUInteger const OMCVisibleCalendarRows = 5;
+static NSString *const OMCDraggedTaskPasteboardType = @"com.deemsd.MenuCalendar.task";
 
 static NSColor *OMCAccentColor(void);
 static NSColor *OMCAccentSoftColor(void);
@@ -17,6 +18,7 @@ static NSColor *OMCDividerColor(void);
 static NSColor *OMCPanelFillColor(void);
 static NSColor *OMCHoverFillColor(void);
 static NSColor *OMCTaskTintColor(void);
+static NSColor *OMCOverdueColor(void);
 static NSColor *OMCColorFromHex(NSString *hex, NSColor *fallback);
 static NSString *OMCHexFromColor(NSColor *color);
 
@@ -195,6 +197,65 @@ static NSString *OMCHexFromColor(NSColor *color);
 }
 @end
 
+@interface OMCRoundColorWell : NSColorWell
+@end
+
+@implementation OMCRoundColorWell
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        self.bordered = NO;
+        self.focusRingType = NSFocusRingTypeNone;
+    }
+    return self;
+}
+- (BOOL)isFlipped { return YES; }
+- (BOOL)acceptsFirstResponder { return YES; }
+- (void)mouseDown:(NSEvent *)event {
+    [self.window makeFirstResponder:self];
+    [self activate:YES];
+}
+- (void)setColor:(NSColor *)color {
+    [super setColor:color];
+    self.needsDisplay = YES;
+}
+- (void)deactivate {
+    [super deactivate];
+    self.needsDisplay = YES;
+}
+- (void)drawRect:(NSRect)dirtyRect {
+    [NSGraphicsContext saveGraphicsState];
+
+    CGFloat diameter = MIN(self.bounds.size.width, self.bounds.size.height) - 3.0;
+    NSRect circleRect = NSMakeRect((self.bounds.size.width - diameter) / 2.0,
+                                  (self.bounds.size.height - diameter) / 2.0,
+                                  diameter,
+                                  diameter);
+    NSBezierPath *circle = [NSBezierPath bezierPathWithOvalInRect:circleRect];
+
+    NSShadow *shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [NSColor colorWithCalibratedWhite:0 alpha:0.16];
+    shadow.shadowBlurRadius = 4;
+    shadow.shadowOffset = NSMakeSize(0, -1);
+    [shadow set];
+
+    [[NSColor colorWithCalibratedWhite:1 alpha:0.72] setFill];
+    [circle fill];
+
+    [NSGraphicsContext restoreGraphicsState];
+
+    NSBezierPath *insetCircle = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(circleRect, 3, 3)];
+    [[self.color ?: OMCTaskTintColor() colorUsingColorSpace:NSColorSpace.sRGBColorSpace] setFill];
+    [insetCircle fill];
+
+    NSBezierPath *stroke = [NSBezierPath bezierPathWithOvalInRect:NSInsetRect(circleRect, 0.75, 0.75)];
+    stroke.lineWidth = self.active ? 2.0 : 1.0;
+    NSColor *strokeColor = self.active ? OMCAccentColor() : [NSColor colorWithCalibratedWhite:0 alpha:0.16];
+    [strokeColor setStroke];
+    [stroke stroke];
+}
+@end
+
 @interface OMCTask : NSObject
 @property (nonatomic, copy) NSString *identifier;
 @property (nonatomic, copy) NSString *title;
@@ -264,6 +325,10 @@ static NSColor *OMCHoverFillColor(void) {
 static NSColor *OMCTaskTintColor(void) {
     NSColor *fallback = [NSColor colorWithCalibratedRed:0.42 green:0.31 blue:0.74 alpha:1.0];
     return OMCColorFromHex([NSUserDefaults.standardUserDefaults stringForKey:@"accentHexColor"], fallback);
+}
+
+static NSColor *OMCOverdueColor(void) {
+    return [NSColor colorWithCalibratedRed:0.96 green:0.24 blue:0.30 alpha:1.0];
 }
 
 static NSArray<NSColor *> *OMCTagColors(void) {
@@ -792,6 +857,26 @@ static NSString *OMCLineByReplacingTaskText(NSString *line, NSString *newText) {
     return [NSString stringWithFormat:@"%@%@%@%@", prefix, state, suffix, OMCTrimmedCollapsedText(newBody)];
 }
 
+static NSString *OMCLineByReplacingDueDate(NSString *line, NSDate *newDate) {
+    NSRegularExpression *regex = OMCRegex(OMCCheckboxPattern());
+    NSTextCheckingResult *match = [regex firstMatchInString:line options:0 range:NSMakeRange(0, line.length)];
+    if (!match || match.numberOfRanges < 5 || !newDate) {
+        return nil;
+    }
+
+    NSString *prefix = [line substringWithRange:[match rangeAtIndex:1]];
+    NSString *state = [line substringWithRange:[match rangeAtIndex:2]];
+    NSString *suffix = [line substringWithRange:[match rangeAtIndex:3]];
+    NSString *body = [line substringWithRange:[match rangeAtIndex:4]];
+    NSString *newDueDate = OMCDueDateString(newDate);
+    if (OMCFirstCapture(body, OMCDueDatePattern(), 0)) {
+        body = OMCReplaceAll(body, OMCDueDatePattern(), newDueDate);
+    } else {
+        body = [body stringByAppendingFormat:@" %@", newDueDate];
+    }
+    return [NSString stringWithFormat:@"%@%@%@%@", prefix, state, suffix, OMCTrimmedCollapsedText(body)];
+}
+
 static OMCTextFile *OMCReadTextFile(NSString *path, NSError **error) {
     NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:error];
     if (!text) {
@@ -909,6 +994,74 @@ static BOOL OMCAppendTaskToDailyNote(OMCConfig *config, NSDate *date, NSString *
     return [OMCRenderTextFile(file) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
 }
 
+static BOOL OMCAppendTaskLineToDailyNote(OMCConfig *config, NSDate *date, NSString *taskLine, NSError **error) {
+    NSString *trimmedLine = [taskLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (OMCFirstCapture(trimmedLine, OMCCheckboxPattern(), 0).length == 0) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ObsidianMenuCalendar" code:13 userInfo:@{NSLocalizedDescriptionKey: @"拖动的内容不是有效任务。"}];
+        }
+        return NO;
+    }
+
+    NSString *path = OMCNotePathForDate(config, date);
+    NSString *directory = path.stringByDeletingLastPathComponent;
+    if (![NSFileManager.defaultManager createDirectoryAtPath:directory withIntermediateDirectories:YES attributes:nil error:error]) {
+        return NO;
+    }
+
+    OMCTextFile *file = nil;
+    if ([NSFileManager.defaultManager fileExistsAtPath:path]) {
+        file = OMCReadTextFile(path, error);
+        if (!file) {
+            return NO;
+        }
+    } else {
+        file = OMCCreateTextFileFromTemplate(config, date, error);
+        if (!file) {
+            file = [[OMCTextFile alloc] init];
+            file.lines = [NSMutableArray array];
+            file.newline = @"\n";
+            file.hasTrailingNewline = YES;
+        }
+    }
+
+    NSInteger headingIndex = NSNotFound;
+    for (NSUInteger index = 0; index < file.lines.count; index++) {
+        if (OMCLineIsTodayTaskHeading(file.lines[index])) {
+            headingIndex = (NSInteger)index;
+            break;
+        }
+    }
+
+    if (headingIndex == NSNotFound) {
+        if (file.lines.count > 0 && !OMCLineIsBlank(file.lines.lastObject)) {
+            [file.lines addObject:@""];
+        }
+        [file.lines addObject:@"### 今日任务"];
+        [file.lines addObject:@""];
+        [file.lines addObject:trimmedLine];
+        file.hasTrailingNewline = YES;
+        return [OMCRenderTextFile(file) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
+    }
+
+    NSInteger sectionStart = headingIndex + 1;
+    NSInteger lastTaskIndex = NSNotFound;
+    for (NSInteger index = sectionStart; index < (NSInteger)file.lines.count; index++) {
+        NSInteger headingLevel = OMCMarkdownHeadingLevel(file.lines[(NSUInteger)index]);
+        if (headingLevel != NSNotFound && headingLevel <= 3) {
+            break;
+        }
+        if (OMCFirstCapture(file.lines[(NSUInteger)index], OMCCheckboxPattern(), 0) != nil) {
+            lastTaskIndex = index;
+        }
+    }
+
+    NSInteger insertIndex = lastTaskIndex != NSNotFound ? lastTaskIndex + 1 : sectionStart;
+    [file.lines insertObject:trimmedLine atIndex:(NSUInteger)insertIndex];
+    file.hasTrailingNewline = YES;
+    return [OMCRenderTextFile(file) writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:error];
+}
+
 static BOOL OMCAppendTaskToMarkdownFile(NSString *path, NSString *taskText, NSError **error) {
     NSString *trimmed = [taskText stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (trimmed.length == 0) {
@@ -963,6 +1116,9 @@ static BOOL OMCAppendTaskToMarkdownFile(NSString *path, NSString *taskText, NSEr
 @property (nonatomic, copy) NSString *dateFormat;
 @property (nonatomic, copy) NSString *accentHexColor;
 @property (nonatomic, assign) NSInteger lookAheadDays;
+@property (nonatomic, assign) NSInteger dotThresholdOne;
+@property (nonatomic, assign) NSInteger dotThresholdTwo;
+@property (nonatomic, assign) NSInteger dotThresholdThree;
 @end
 
 @implementation OMCConfig
@@ -974,6 +1130,9 @@ static BOOL OMCAppendTaskToMarkdownFile(NSString *path, NSString *taskText, NSEr
         _dateFormat = @"yyyy-MM-dd";
         _accentHexColor = @"#6B4FBD";
         _lookAheadDays = 14;
+        _dotThresholdOne = 1;
+        _dotThresholdTwo = 4;
+        _dotThresholdThree = 9;
     }
     return self;
 }
@@ -996,11 +1155,17 @@ static OMCConfig *OMCLoadConfig(void) {
     NSString *dateFormat = [defaults stringForKey:@"dateFormat"];
     NSString *accentHexColor = [defaults stringForKey:@"accentHexColor"];
     NSInteger lookAhead = [defaults integerForKey:@"lookAheadDays"];
+    NSInteger dotOne = [defaults integerForKey:@"dotThresholdOne"];
+    NSInteger dotTwo = [defaults integerForKey:@"dotThresholdTwo"];
+    NSInteger dotThree = [defaults integerForKey:@"dotThresholdThree"];
     if (vaultPath) config.vaultPath = vaultPath;
     if (dailyFolder) config.dailyFolder = dailyFolder;
     if (dateFormat) config.dateFormat = dateFormat;
     if (accentHexColor) config.accentHexColor = accentHexColor;
     if (lookAhead > 0) config.lookAheadDays = lookAhead;
+    if (dotOne > 0) config.dotThresholdOne = dotOne;
+    if (dotTwo > 0) config.dotThresholdTwo = dotTwo;
+    if (dotThree > 0) config.dotThresholdThree = dotThree;
     return config;
 }
 
@@ -1011,6 +1176,9 @@ static void OMCSaveConfig(OMCConfig *config) {
     [defaults setObject:config.dateFormat ?: @"yyyy-MM-dd" forKey:@"dateFormat"];
     [defaults setObject:config.accentHexColor ?: @"#6B4FBD" forKey:@"accentHexColor"];
     [defaults setInteger:config.lookAheadDays forKey:@"lookAheadDays"];
+    [defaults setInteger:config.dotThresholdOne forKey:@"dotThresholdOne"];
+    [defaults setInteger:config.dotThresholdTwo forKey:@"dotThresholdTwo"];
+    [defaults setInteger:config.dotThresholdThree forKey:@"dotThresholdThree"];
 }
 
 static BOOL OMCLoginItemEnabled(void) {
@@ -1164,6 +1332,61 @@ static NSString *OMCResolvedDailyNotesPath(OMCConfig *config) {
     return resolved;
 }
 
+static NSInteger OMCDailyNoteFileScore(NSString *path, NSString *basePath) {
+    NSString *text = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil] ?: @"";
+    NSUInteger taskCount = [OMCRegex(OMCCheckboxPattern()) numberOfMatchesInString:text options:0 range:NSMakeRange(0, text.length)];
+    NSUInteger nonBlankCount = 0;
+    for (NSString *line in [text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]) {
+        if ([line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet].length > 0) {
+            nonBlankCount += 1;
+        }
+    }
+
+    NSString *relative = [path hasPrefix:basePath] ? [path substringFromIndex:basePath.length] : path;
+    NSUInteger depth = [[relative componentsSeparatedByString:@"/"] filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(NSString *part, NSDictionary *bindings) {
+        return part.length > 0;
+    }]].count;
+    return (NSInteger)taskCount * 100000 + (NSInteger)nonBlankCount * 10 + (NSInteger)depth;
+}
+
+static NSString *OMCExistingChildDirectory(NSString *parent, NSArray<NSString *> *names) {
+    NSFileManager *fileManager = NSFileManager.defaultManager;
+    for (NSString *name in names) {
+        NSString *path = [parent stringByAppendingPathComponent:name];
+        BOOL isDirectory = NO;
+        if ([fileManager fileExistsAtPath:path isDirectory:&isDirectory] && isDirectory) {
+            return path;
+        }
+    }
+    return nil;
+}
+
+static NSString *OMCPreferredMonthlyFolderForDate(NSString *basePath, NSDate *date) {
+    NSString *year = [OMCDateFormatter(@"yyyy") stringFromDate:date];
+    NSString *yearCN = [OMCDateFormatter(@"yyyy年") stringFromDate:date];
+    NSString *month = [OMCDateFormatter(@"yyyy-MM") stringFromDate:date];
+    NSString *monthLoose = [OMCDateFormatter(@"yyyy-M") stringFromDate:date];
+    NSString *monthCN = [OMCDateFormatter(@"yyyy年MM月") stringFromDate:date];
+    NSString *monthLooseCN = [OMCDateFormatter(@"yyyy年M月") stringFromDate:date];
+    NSString *monthNumber = [OMCDateFormatter(@"MM") stringFromDate:date];
+    NSString *monthNumberLoose = [OMCDateFormatter(@"M") stringFromDate:date];
+    NSString *monthNumberCN = [OMCDateFormatter(@"MM月") stringFromDate:date];
+    NSString *monthNumberLooseCN = [OMCDateFormatter(@"M月") stringFromDate:date];
+
+    NSArray<NSString *> *yearNames = @[year, yearCN];
+    NSString *yearPath = OMCExistingChildDirectory(basePath, yearNames);
+    if (yearPath.length == 0) {
+        yearPath = [basePath stringByAppendingPathComponent:year];
+    }
+
+    NSArray<NSString *> *monthNames = @[month, monthLoose, monthCN, monthLooseCN, monthNumber, monthNumberLoose, monthNumberCN, monthNumberLooseCN];
+    NSString *monthPath = OMCExistingChildDirectory(yearPath, monthNames);
+    if (monthPath.length == 0) {
+        monthPath = [yearPath stringByAppendingPathComponent:month];
+    }
+    return monthPath;
+}
+
 static NSString *OMCNotePathForDate(OMCConfig *config, NSDate *date) {
     NSDateFormatter *formatter = OMCDateFormatter(config.dateFormat.length > 0 ? config.dateFormat : @"yyyy-MM-dd");
     NSString *fileName = [[formatter stringFromDate:date] stringByAppendingPathExtension:@"md"];
@@ -1173,20 +1396,46 @@ static NSString *OMCNotePathForDate(OMCConfig *config, NSDate *date) {
     NSString *monthLoose = [OMCDateFormatter(@"yyyy-M") stringFromDate:date];
     NSString *monthNumber = [OMCDateFormatter(@"MM") stringFromDate:date];
     NSString *monthNumberLoose = [OMCDateFormatter(@"M") stringFromDate:date];
+    NSString *yearCN = [OMCDateFormatter(@"yyyy年") stringFromDate:date];
+    NSString *monthCN = [OMCDateFormatter(@"yyyy年MM月") stringFromDate:date];
+    NSString *monthLooseCN = [OMCDateFormatter(@"yyyy年M月") stringFromDate:date];
+    NSString *monthNumberCN = [OMCDateFormatter(@"MM月") stringFromDate:date];
+    NSString *monthNumberLooseCN = [OMCDateFormatter(@"M月") stringFromDate:date];
 
     NSArray<NSString *> *candidates = @[
-        [basePath stringByAppendingPathComponent:fileName],
         [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[month stringByAppendingPathComponent:fileName]],
         [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthLoose stringByAppendingPathComponent:fileName]],
         [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthNumber stringByAppendingPathComponent:fileName]],
-        [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthNumberLoose stringByAppendingPathComponent:fileName]]
+        [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthNumberLoose stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthLooseCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthNumberCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[monthNumberLooseCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[month stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthLoose stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthNumber stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthNumberLoose stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthLooseCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthNumberCN stringByAppendingPathComponent:fileName]],
+        [[basePath stringByAppendingPathComponent:yearCN] stringByAppendingPathComponent:[monthNumberLooseCN stringByAppendingPathComponent:fileName]],
+        [basePath stringByAppendingPathComponent:fileName]
     ];
 
+    NSString *bestExisting = nil;
+    NSInteger bestExistingScore = NSIntegerMin;
     for (NSString *candidate in candidates) {
         BOOL isDirectory = NO;
         if ([NSFileManager.defaultManager fileExistsAtPath:candidate isDirectory:&isDirectory] && !isDirectory) {
-            return candidate;
+            NSInteger score = OMCDailyNoteFileScore(candidate, basePath);
+            if (score > bestExistingScore) {
+                bestExistingScore = score;
+                bestExisting = candidate;
+            }
         }
+    }
+    if (bestExisting.length > 0) {
+        return bestExisting;
     }
 
     NSString *cacheKey = [NSString stringWithFormat:@"note|%@|%@|%@", basePath ?: @"", config.dateFormat ?: @"", fileName];
@@ -1221,12 +1470,19 @@ static NSString *OMCNotePathForDate(OMCConfig *config, NSDate *date) {
         }
 
         if ([url.lastPathComponent isEqualToString:fileName]) {
-            OMCResolvedDailyNotesPathCache()[cacheKey] = url.path;
-            return url.path;
+            NSInteger score = OMCDailyNoteFileScore(url.path, basePath);
+            if (score > bestExistingScore) {
+                bestExistingScore = score;
+                bestExisting = url.path;
+            }
         }
     }
+    if (bestExisting.length > 0) {
+        OMCResolvedDailyNotesPathCache()[cacheKey] = bestExisting;
+        return bestExisting;
+    }
 
-    return [[basePath stringByAppendingPathComponent:year] stringByAppendingPathComponent:[month stringByAppendingPathComponent:fileName]];
+    return [OMCPreferredMonthlyFolderForDate(basePath, date) stringByAppendingPathComponent:fileName];
 }
 
 static NSString *OMCTaskCacheKey(NSString *path, NSDate *date) {
@@ -1602,6 +1858,64 @@ static BOOL OMCDeleteTask(OMCTask *task, NSError **error) {
     return [OMCRenderTextFile(file) writeToFile:task.filePath atomically:YES encoding:NSUTF8StringEncoding error:error];
 }
 
+static BOOL OMCMoveTaskToDate(OMCConfig *config, OMCTask *task, NSDate *targetDate, NSError **error) {
+    NSDate *targetDay = OMCStartOfDay(targetDate);
+    if (!task || !targetDay) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ObsidianMenuCalendar" code:14 userInfo:@{NSLocalizedDescriptionKey: @"没有找到要移动的任务。"}];
+        }
+        return NO;
+    }
+    if ([OMCCalendar() isDate:task.date inSameDayAsDate:targetDay]) {
+        return YES;
+    }
+    if (![NSFileManager.defaultManager fileExistsAtPath:task.filePath]) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ObsidianMenuCalendar" code:15 userInfo:@{NSLocalizedDescriptionKey: @"无法读取或写入目标文件。"}];
+        }
+        return NO;
+    }
+
+    OMCTextFile *sourceFile = OMCReadTextFile(task.filePath, error);
+    if (!sourceFile) {
+        return NO;
+    }
+
+    NSInteger index = OMCLocateTask(task, sourceFile.lines);
+    if (index == NSNotFound) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ObsidianMenuCalendar" code:16 userInfo:@{NSLocalizedDescriptionKey: @"这条任务已经在 Obsidian 中被移动或修改，已刷新列表，没有覆盖你的新内容。"}];
+        }
+        return NO;
+    }
+
+    NSString *updatedLine = OMCLineByReplacingDueDate(sourceFile.lines[(NSUInteger)index], targetDay);
+    if (!updatedLine) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ObsidianMenuCalendar" code:17 userInfo:@{NSLocalizedDescriptionKey: @"目标行已经不再是任务，无法移动。"}];
+        }
+        return NO;
+    }
+
+    if (OMCPathIsDailyNoteForTask(config, task)) {
+        NSString *targetPath = [OMCNotePathForDate(config, targetDay) stringByStandardizingPath];
+        NSString *sourcePath = [task.filePath stringByStandardizingPath];
+        if ([targetPath isEqualToString:sourcePath]) {
+            sourceFile.lines[(NSUInteger)index] = updatedLine;
+            return [OMCRenderTextFile(sourceFile) writeToFile:task.filePath atomically:YES encoding:NSUTF8StringEncoding error:error];
+        }
+
+        if (!OMCAppendTaskLineToDailyNote(config, targetDay, updatedLine, error)) {
+            return NO;
+        }
+        [sourceFile.lines removeObjectAtIndex:(NSUInteger)index];
+        return [OMCRenderTextFile(sourceFile) writeToFile:task.filePath atomically:YES encoding:NSUTF8StringEncoding error:error];
+    }
+
+    sourceFile.lines[(NSUInteger)index] = updatedLine;
+    return [OMCRenderTextFile(sourceFile) writeToFile:task.filePath atomically:YES encoding:NSUTF8StringEncoding error:error];
+}
+
 static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     return [tasks sortedArrayUsingComparator:^NSComparisonResult(OMCTask *a, OMCTask *b) {
         if (a.done != b.done) {
@@ -1616,15 +1930,32 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 }
 
 @class OMCAppDelegate;
+@class OMCDayCell;
+
+@protocol OMCDayCellDropDelegate <NSObject>
+- (BOOL)dayCell:(OMCDayCell *)cell acceptDraggedTaskIdentifier:(NSString *)identifier;
+@end
 
 @interface OMCDayCell : NSControl
 @property (nonatomic, strong) NSDate *date;
 @property (nonatomic, strong) NSDate *visibleMonth;
 @property (nonatomic, strong) NSDate *selectedDate;
 @property (nonatomic, copy) NSArray<OMCTask *> *tasks;
+@property (nonatomic, weak) id<OMCDayCellDropDelegate> dropDelegate;
+@property (nonatomic, assign) BOOL dragHighlighted;
+@property (nonatomic, assign) NSInteger dotThresholdOne;
+@property (nonatomic, assign) NSInteger dotThresholdTwo;
+@property (nonatomic, assign) NSInteger dotThresholdThree;
 @end
 
 @implementation OMCDayCell
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        [self registerForDraggedTypes:@[OMCDraggedTaskPasteboardType]];
+    }
+    return self;
+}
 - (BOOL)isFlipped { return YES; }
 - (void)drawRect:(NSRect)dirtyRect {
     [super drawRect:dirtyRect];
@@ -1635,6 +1966,15 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 
     CGFloat markerSize = 29;
     NSRect insetBounds = NSMakeRect((self.bounds.size.width - markerSize) / 2, 1, markerSize, markerSize);
+    if (self.dragHighlighted) {
+        [[OMCTaskTintColor() colorWithAlphaComponent:0.16] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 2, 1) xRadius:9 yRadius:9] fill];
+        [[OMCTaskTintColor() colorWithAlphaComponent:0.62] setStroke];
+        NSBezierPath *dropPath = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(self.bounds, 2.5, 1.5) xRadius:9 yRadius:9];
+        dropPath.lineWidth = 1.2;
+        [dropPath stroke];
+    }
+
     if (isToday) {
         [OMCAccentColor() setFill];
         [[NSBezierPath bezierPathWithRoundedRect:insetBounds xRadius:8 yRadius:8] fill];
@@ -1677,11 +2017,14 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     CGFloat spacing = 3.5;
     NSUInteger taskCount = self.tasks.count;
     NSUInteger dotCount = 0;
-    if (taskCount >= 9) {
+    NSInteger thresholdOne = self.dotThresholdOne > 0 ? self.dotThresholdOne : 1;
+    NSInteger thresholdTwo = self.dotThresholdTwo > thresholdOne ? self.dotThresholdTwo : thresholdOne + 1;
+    NSInteger thresholdThree = self.dotThresholdThree > thresholdTwo ? self.dotThresholdThree : thresholdTwo + 1;
+    if (taskCount >= (NSUInteger)thresholdThree) {
         dotCount = 3;
-    } else if (taskCount >= 4) {
+    } else if (taskCount >= (NSUInteger)thresholdTwo) {
         dotCount = 2;
-    } else if (taskCount >= 1) {
+    } else if (taskCount >= (NSUInteger)thresholdOne) {
         dotCount = 1;
     }
     CGFloat totalWidth = dotCount == 0 ? 0 : dotCount * dotSize + (dotCount - 1) * spacing;
@@ -1699,10 +2042,91 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 - (void)mouseDown:(NSEvent *)event {
     [self sendAction:self.action to:self.target];
 }
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSString *identifier = [sender.draggingPasteboard stringForType:OMCDraggedTaskPasteboardType];
+    if (identifier.length == 0) {
+        return NSDragOperationNone;
+    }
+    self.dragHighlighted = YES;
+    self.needsDisplay = YES;
+    return NSDragOperationMove;
+}
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    return [sender.draggingPasteboard stringForType:OMCDraggedTaskPasteboardType].length > 0 ? NSDragOperationMove : NSDragOperationNone;
+}
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    self.dragHighlighted = NO;
+    self.needsDisplay = YES;
+}
+- (void)draggingEnded:(id<NSDraggingInfo>)sender {
+    self.dragHighlighted = NO;
+    self.needsDisplay = YES;
+}
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSString *identifier = [sender.draggingPasteboard stringForType:OMCDraggedTaskPasteboardType];
+    self.dragHighlighted = NO;
+    self.needsDisplay = YES;
+    if (identifier.length == 0) {
+        return NO;
+    }
+    return [self.dropDelegate dayCell:self acceptDraggedTaskIdentifier:identifier];
+}
+@end
+
+@interface OMCTaskDragView : NSView <NSDraggingSource>
+@property (nonatomic, strong) OMCTask *task;
+@end
+
+@implementation OMCTaskDragView {
+    NSPoint _mouseDownPoint;
+    BOOL _dragging;
+}
+- (BOOL)isFlipped { return YES; }
+- (void)mouseDown:(NSEvent *)event {
+    _mouseDownPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    _dragging = NO;
+}
+- (void)mouseDragged:(NSEvent *)event {
+    if (_dragging || self.task.identifier.length == 0) {
+        return;
+    }
+    NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat dx = point.x - _mouseDownPoint.x;
+    CGFloat dy = point.y - _mouseDownPoint.y;
+    if (sqrt(dx * dx + dy * dy) < 4.0) {
+        return;
+    }
+    _dragging = YES;
+
+    NSPasteboardItem *item = [[NSPasteboardItem alloc] init];
+    [item setString:self.task.identifier forType:OMCDraggedTaskPasteboardType];
+
+    NSString *title = self.task.title.length > 0 ? self.task.title : @"任务";
+    NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(170, 36)];
+    [image lockFocus];
+    [[NSColor colorWithCalibratedWhite:1 alpha:0.94] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(0, 0, 170, 36) xRadius:8 yRadius:8] fill];
+    [[OMCTaskTintColor() colorWithAlphaComponent:0.92] setFill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(9, 8, 4, 20) xRadius:2 yRadius:2] fill];
+    NSDictionary *attrs = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
+        NSForegroundColorAttributeName: OMCTextColor()
+    };
+    [title drawInRect:NSMakeRect(22, 9, 138, 18) withAttributes:attrs];
+    [image unlockFocus];
+
+    NSDraggingItem *draggingItem = [[NSDraggingItem alloc] initWithPasteboardWriter:item];
+    [draggingItem setDraggingFrame:NSMakeRect(point.x - 18, point.y - 18, 170, 36) contents:image];
+    [self beginDraggingSessionWithItems:@[draggingItem] event:event source:self];
+}
+- (NSDragOperation)draggingSession:(NSDraggingSession *)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    return NSDragOperationMove;
+}
 @end
 
 @interface OMCTaskButton : NSButton
 @property (nonatomic, strong) OMCTask *task;
+@property (nonatomic, strong) NSColor *overrideColor;
 @end
 
 @implementation OMCTaskButton
@@ -1712,7 +2136,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     self.needsDisplay = YES;
 }
 - (void)drawRect:(NSRect)dirtyRect {
-    NSColor *taskColor = OMCColorForTask(self.task);
+    NSColor *taskColor = self.overrideColor ?: OMCColorForTask(self.task);
     CGFloat side = MIN(self.bounds.size.width, self.bounds.size.height) - 5;
     NSRect box = NSMakeRect((self.bounds.size.width - side) / 2, (self.bounds.size.height - side) / 2, side, side);
     NSBezierPath *boxPath = [NSBezierPath bezierPathWithRoundedRect:box xRadius:4 yRadius:4];
@@ -1750,7 +2174,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 @implementation OMCDayButton
 @end
 
-@interface OMCAppDelegate : NSObject <NSApplicationDelegate, NSTextFieldDelegate>
+@interface OMCAppDelegate : NSObject <NSApplicationDelegate, NSTextFieldDelegate, OMCDayCellDropDelegate>
 @property (nonatomic, strong) NSStatusItem *statusItem;
 @property (nonatomic, strong) OMCInputPanel *calendarPanel;
 @property (nonatomic, strong) NSViewController *viewController;
@@ -1769,6 +2193,9 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 @property (nonatomic, strong) NSTextField *formatField;
 @property (nonatomic, strong) NSTextField *lookAheadField;
 @property (nonatomic, strong) NSColorWell *accentColorWell;
+@property (nonatomic, strong) NSTextField *dotOneField;
+@property (nonatomic, strong) NSTextField *dotTwoField;
+@property (nonatomic, strong) NSTextField *dotThreeField;
 @property (nonatomic, strong) NSButton *launchAtLoginButton;
 @property (nonatomic, strong) NSPanel *addTaskPanel;
 @property (nonatomic, strong) NSTextField *addTaskInput;
@@ -1912,6 +2339,37 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
             return event;
         }
 
+        NSWindow *window = strongSelf.calendarPanel;
+        BOOL commandDown = (event.modifierFlags & NSEventModifierFlagCommand) == NSEventModifierFlagCommand;
+        if (commandDown && [window.firstResponder isKindOfClass:NSTextView.class]) {
+            NSTextView *textView = (NSTextView *)window.firstResponder;
+            NSString *key = event.charactersIgnoringModifiers.lowercaseString ?: @"";
+            if ([key isEqualToString:@"v"]) {
+                [textView paste:nil];
+                return nil;
+            }
+            if ([key isEqualToString:@"c"]) {
+                [textView copy:nil];
+                return nil;
+            }
+            if ([key isEqualToString:@"x"]) {
+                [textView cut:nil];
+                return nil;
+            }
+            if ([key isEqualToString:@"a"]) {
+                [textView selectAll:nil];
+                return nil;
+            }
+            if ([key isEqualToString:@"z"]) {
+                if ((event.modifierFlags & NSEventModifierFlagShift) == NSEventModifierFlagShift) {
+                    [textView.undoManager redo];
+                } else {
+                    [textView.undoManager undo];
+                }
+                return nil;
+            }
+        }
+
         BOOL isSpace = event.keyCode == 49;
         BOOL isReturn = event.keyCode == 36 || event.keyCode == 76;
         if (!isSpace && !isReturn) {
@@ -1922,7 +2380,6 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
             return nil;
         }
 
-        NSWindow *window = strongSelf.calendarPanel;
         id fieldEditor = [window fieldEditor:NO forObject:strongSelf.inlineTaskInput];
         BOOL inputHasFocus = fieldEditor && window.firstResponder == fieldEditor;
         if (inputHasFocus) {
@@ -1981,6 +2438,41 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     }
     return [tasks sortedArrayUsingComparator:^NSComparisonResult(OMCTask *a, OMCTask *b) {
         NSComparisonResult dateResult = [a.date compare:b.date];
+        if (dateResult != NSOrderedSame) return dateResult;
+        NSString *left = a.timeText ?: @"99:99";
+        NSString *right = b.timeText ?: @"99:99";
+        NSComparisonResult timeResult = [left compare:right];
+        if (timeResult != NSOrderedSame) return timeResult;
+        return [a.title compare:b.title];
+    }];
+}
+
+- (NSArray<OMCTask *> *)tasksForDate:(NSDate *)date done:(BOOL)done {
+    NSMutableArray<OMCTask *> *filtered = [NSMutableArray array];
+    for (OMCTask *task in [self tasksForDate:date]) {
+        if (task.done == done) {
+            [filtered addObject:task];
+        }
+    }
+    return filtered;
+}
+
+- (NSArray<OMCTask *> *)overdueTasks {
+    NSMutableArray<OMCTask *> *tasks = [NSMutableArray array];
+    NSDate *today = OMCStartOfDay([NSDate date]);
+    for (NSString *key in self.tasksByDate) {
+        NSDate *date = [OMCDateFormatter(@"yyyy-MM-dd") dateFromString:key];
+        if (!date || [date compare:today] != NSOrderedAscending) {
+            continue;
+        }
+        for (OMCTask *task in self.tasksByDate[key]) {
+            if (!task.done) {
+                [tasks addObject:task];
+            }
+        }
+    }
+    return [tasks sortedArrayUsingComparator:^NSComparisonResult(OMCTask *a, OMCTask *b) {
+        NSComparisonResult dateResult = [b.date compare:a.date];
         if (dateResult != NSOrderedSame) return dateResult;
         NSString *left = a.timeText ?: @"99:99";
         NSString *right = b.timeText ?: @"99:99";
@@ -2078,6 +2570,97 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     entry.tasks = tasks ?: @[];
     self.taskCache[cacheKey] = entry;
     return entry.tasks;
+}
+
+- (NSArray<OMCTask *> *)cachedDailyTasksFromFile:(NSString *)path date:(NSDate *)date watchPaths:(NSMutableSet<NSString *> *)watchPaths error:(NSError **)error {
+    if (path.length > 0) {
+        [watchPaths addObject:path];
+    }
+
+    BOOL isDirectory = NO;
+    BOOL exists = [NSFileManager.defaultManager fileExistsAtPath:path isDirectory:&isDirectory] && !isDirectory;
+    NSDate *modificationDate = nil;
+    if (exists) {
+        NSDictionary<NSFileAttributeKey, id> *attributes = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+        modificationDate = attributes[NSFileModificationDate];
+    }
+
+    NSString *cacheKey = OMCTaskCacheKey(path, date);
+    OMCTaskCacheEntry *cached = self.taskCache[cacheKey];
+    if (cached && cached.exists == exists && OMCNullableDatesEqual(cached.modificationDate, modificationDate)) {
+        return cached.tasks ?: @[];
+    }
+
+    NSArray<OMCTask *> *tasks = @[];
+    if (exists) {
+        OMCTextFile *file = OMCReadTextFile(path, error);
+        if (!file) {
+            return @[];
+        }
+
+        NSMutableArray<OMCTask *> *parsed = [NSMutableArray array];
+        [file.lines enumerateObjectsUsingBlock:^(NSString *line, NSUInteger index, BOOL *stop) {
+            OMCTask *task = OMCParseTaskLine(line, (NSInteger)index, path, date);
+            if (task) {
+                [parsed addObject:task];
+            }
+        }];
+        tasks = parsed;
+    }
+
+    OMCTaskCacheEntry *entry = [[OMCTaskCacheEntry alloc] init];
+    entry.exists = exists;
+    entry.modificationDate = modificationDate;
+    entry.tasks = tasks ?: @[];
+    self.taskCache[cacheKey] = entry;
+    return entry.tasks;
+}
+
+- (NSArray<OMCTask *> *)cachedOverdueDailyTasksWithWatchPaths:(NSMutableSet<NSString *> *)watchPaths error:(NSError **)error {
+    NSMutableArray<OMCTask *> *tasks = [NSMutableArray array];
+    NSString *basePath = self.config.dailyNotesPath.stringByStandardizingPath;
+    NSDate *today = OMCStartOfDay([NSDate date]);
+    NSDate *earliest = [OMCCalendar() dateByAddingUnit:NSCalendarUnitDay value:-730 toDate:today options:0];
+    NSDateFormatter *formatter = OMCDateFormatter(self.config.dateFormat.length > 0 ? self.config.dateFormat : @"yyyy-MM-dd");
+
+    NSDirectoryEnumerator<NSURL *> *enumerator = [NSFileManager.defaultManager enumeratorAtURL:[NSURL fileURLWithPath:basePath]
+                                                                    includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+                                                                                       options:NSDirectoryEnumerationSkipsHiddenFiles
+                                                                                  errorHandler:nil];
+    NSUInteger scanned = 0;
+    for (NSURL *url in enumerator) {
+        scanned += 1;
+        if (scanned > 8000) {
+            break;
+        }
+
+        NSNumber *isDir = nil;
+        [url getResourceValue:&isDir forKey:NSURLIsDirectoryKey error:nil];
+        if (isDir.boolValue) {
+            NSString *name = url.lastPathComponent;
+            if ([name isEqualToString:@".obsidian"] || [name isEqualToString:@".trash"] || [name isEqualToString:@"附件"] || [name.lowercaseString isEqualToString:@"attachments"]) {
+                [enumerator skipDescendants];
+            }
+            continue;
+        }
+
+        if (![url.pathExtension.lowercaseString isEqualToString:@"md"]) {
+            continue;
+        }
+        NSString *baseName = url.lastPathComponent.stringByDeletingPathExtension;
+        NSDate *date = OMCStartOfDay([formatter dateFromString:baseName]);
+        if (!date || [date compare:earliest] == NSOrderedAscending || [date compare:today] != NSOrderedAscending) {
+            continue;
+        }
+
+        NSArray<OMCTask *> *dailyTasks = [self cachedDailyTasksFromFile:url.path date:date watchPaths:watchPaths error:error];
+        for (OMCTask *task in dailyTasks) {
+            if (!task.done) {
+                [tasks addObject:task];
+            }
+        }
+    }
+    return tasks;
 }
 
 - (NSArray<OMCTask *> *)cachedExtraTasksWithWatchPaths:(NSMutableSet<NSString *> *)watchPaths error:(NSError **)error {
@@ -2188,6 +2771,17 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     for (NSDate *date in dates) {
         NSArray<OMCTask *> *tasks = [self cachedTasksForDate:date watchPaths:watchPaths error:&loadError];
         self.tasksByDate[OMCCanonicalDateKey(date)] = tasks ?: @[];
+    }
+
+    NSArray<OMCTask *> *overdueDailyTasks = [self cachedOverdueDailyTasksWithWatchPaths:watchPaths error:&loadError];
+    for (OMCTask *task in overdueDailyTasks) {
+        NSString *key = OMCCanonicalDateKey(task.date);
+        if ([dateKeys containsObject:key]) {
+            continue;
+        }
+        NSMutableArray<OMCTask *> *merged = [self.tasksByDate[key] mutableCopy] ?: [NSMutableArray array];
+        [merged addObject:task];
+        self.tasksByDate[key] = merged;
     }
 
     NSArray<OMCTask *> *extraTasks = [self cachedExtraTasksWithWatchPaths:watchPaths error:&loadError];
@@ -2341,8 +2935,12 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
         cell.visibleMonth = self.visibleMonth;
         cell.selectedDate = self.selectedDate;
         cell.tasks = [self tasksForDate:date];
+        cell.dotThresholdOne = self.config.dotThresholdOne;
+        cell.dotThresholdTwo = self.config.dotThresholdTwo;
+        cell.dotThresholdThree = self.config.dotThresholdThree;
         cell.target = self;
         cell.action = @selector(selectDay:);
+        cell.dropDelegate = self;
         [root addSubview:cell];
     }
 }
@@ -2358,10 +2956,21 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 
     OMCFlippedView *document = [[OMCFlippedView alloc] initWithFrame:NSMakeRect(0, 0, OMCWidth, 800)];
     CGFloat cursor = 0;
-    cursor = [self addTaskSectionToView:document title:[OMCCalendar() isDateInToday:self.selectedDate] ? @"今天" : OMCShortDate(self.selectedDate) empty:@"这天还没有任务" tasks:[self tasksForDate:self.selectedDate] y:cursor showsDate:NO allowsAdd:YES];
+    NSArray<OMCTask *> *selectedOpenTasks = [self tasksForDate:self.selectedDate done:NO];
+    NSArray<OMCTask *> *selectedDoneTasks = [self tasksForDate:self.selectedDate done:YES];
+    cursor = [self addTaskSectionToView:document title:[OMCCalendar() isDateInToday:self.selectedDate] ? @"今天" : OMCShortDate(self.selectedDate) empty:@"这天还没有任务" tasks:selectedOpenTasks y:cursor showsDate:NO allowsAdd:YES highlightsOverdue:NO];
+    if (selectedDoneTasks.count > 0) {
+        cursor = [self addTaskSectionToView:document title:@"已完成" empty:@"" tasks:selectedDoneTasks y:cursor showsDate:NO allowsAdd:NO highlightsOverdue:NO];
+    }
+    NSArray<OMCTask *> *overdueTasks = [self overdueTasks];
+    if (overdueTasks.count > 0) {
+        [self addDividerToView:document y:cursor + 4];
+        cursor += 12;
+        cursor = [self addTaskSectionToView:document title:@"已过期" empty:@"" tasks:overdueTasks y:cursor showsDate:YES allowsAdd:NO highlightsOverdue:YES];
+    }
     [self addDividerToView:document y:cursor + 4];
     cursor += 12;
-    cursor = [self addTaskSectionToView:document title:@"即将到来" empty:@"未来几天没有待办" tasks:[self upcomingTasks] y:cursor showsDate:YES allowsAdd:NO];
+    cursor = [self addTaskSectionToView:document title:@"即将到来" empty:@"未来几天没有待办" tasks:[self upcomingTasks] y:cursor showsDate:YES allowsAdd:NO highlightsOverdue:NO];
 
     CGFloat footerY = cursor + 8;
     OMCChromeButton *open = [self chromeButtonWithTitle:@"打开当天笔记" frame:NSMakeRect(12, footerY, 96, 22) pill:NO action:@selector(openDailyNote:)];
@@ -2389,7 +2998,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     [root addSubview:scroll];
 }
 
-- (CGFloat)addTaskSectionToView:(NSView *)view title:(NSString *)title empty:(NSString *)empty tasks:(NSArray<OMCTask *> *)tasks y:(CGFloat)y showsDate:(BOOL)showsDate allowsAdd:(BOOL)allowsAdd {
+- (CGFloat)addTaskSectionToView:(NSView *)view title:(NSString *)title empty:(NSString *)empty tasks:(NSArray<OMCTask *> *)tasks y:(CGFloat)y showsDate:(BOOL)showsDate allowsAdd:(BOOL)allowsAdd highlightsOverdue:(BOOL)highlightsOverdue {
     NSTextField *titleLabel = [self labelWithText:title
                                             frame:NSMakeRect(14, y + 10, OMCWidth - 28, 16)
                                              font:[NSFont systemFontOfSize:13 weight:NSFontWeightSemibold]
@@ -2420,7 +3029,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     }
 
     for (OMCTask *task in tasks) {
-        [self addTaskRowToView:view task:task y:cursor showsDate:showsDate];
+        [self addTaskRowToView:view task:task y:cursor showsDate:showsDate highlightsOverdue:highlightsOverdue];
         cursor += 58;
     }
     return cursor;
@@ -2439,8 +3048,8 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     input.action = @selector(confirmInlineTaskInput:);
     input.bezelStyle = NSTextFieldRoundedBezel;
     input.focusRingType = NSFocusRingTypeExterior;
-    input.editable = self.inlineInputActive;
-    input.selectable = self.inlineInputActive;
+    input.editable = YES;
+    input.selectable = YES;
     [view addSubview:input];
     self.inlineTaskInput = input;
 
@@ -2450,7 +3059,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     [view addSubview:add];
 }
 
-- (void)addTaskRowToView:(NSView *)view task:(OMCTask *)task y:(CGFloat)y showsDate:(BOOL)showsDate {
+- (void)addTaskRowToView:(NSView *)view task:(OMCTask *)task y:(CGFloat)y showsDate:(BOOL)showsDate highlightsOverdue:(BOOL)highlightsOverdue {
     NSMenu *taskMenu = [self taskContextMenuForTask:task];
 
     OMCRowBackgroundView *background = [[OMCRowBackgroundView alloc] initWithFrame:NSMakeRect(8, y, OMCWidth - 16, 54)];
@@ -2459,6 +3068,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 
     OMCTaskButton *check = [[OMCTaskButton alloc] initWithFrame:NSMakeRect(14, y + 16, 20, 20)];
     check.task = task;
+    check.overrideColor = highlightsOverdue ? OMCOverdueColor() : nil;
     check.bordered = NO;
     check.title = @"";
     check.image = nil;
@@ -2468,7 +3078,8 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     [view addSubview:check];
 
     OMCColorBarView *bar = [[OMCColorBarView alloc] initWithFrame:NSMakeRect(42, y + 9, 3, 38)];
-    bar.fillColor = [OMCColorForTask(task) colorWithAlphaComponent:task.done ? 0.35 : 0.9];
+    NSColor *rowColor = highlightsOverdue ? OMCOverdueColor() : OMCColorForTask(task);
+    bar.fillColor = [rowColor colorWithAlphaComponent:task.done ? 0.35 : 0.9];
     bar.menu = taskMenu;
     [view addSubview:bar];
 
@@ -2479,7 +3090,7 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     NSTextField *title = [self labelWithText:task.title.length > 0 ? task.title : @"未命名任务"
                                        frame:NSMakeRect(textX, y + 8, textWidth, 19)
                                         font:[NSFont systemFontOfSize:13.5 weight:NSFontWeightSemibold]
-                                       color:task.done ? OMCSecondaryTextColor() : OMCTextColor()];
+                                       color:task.done ? OMCSecondaryTextColor() : (highlightsOverdue ? OMCOverdueColor() : OMCTextColor())];
     if (task.done) {
         NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:title.stringValue attributes:@{
             NSFontAttributeName: title.font,
@@ -2505,12 +3116,12 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     NSTextField *subtitle = [self labelWithText:subtitleText
                                           frame:NSMakeRect(textX, y + 31, textWidth, 16)
                                           font:[NSFont systemFontOfSize:11 weight:NSFontWeightMedium]
-                                          color:[OMCSecondaryTextColor() colorWithAlphaComponent:0.82]];
+                                          color:highlightsOverdue ? [OMCOverdueColor() colorWithAlphaComponent:0.62] : [OMCSecondaryTextColor() colorWithAlphaComponent:0.82]];
     subtitle.menu = taskMenu;
     [view addSubview:subtitle];
 
     NSString *timeDisplay = task.timeText.length > 0 ? task.timeText : @"全天";
-    NSColor *timeColor = task.timeText.length > 0 ? (task.done ? [OMCSecondaryTextColor() colorWithAlphaComponent:0.62] : OMCTextColor()) : [OMCSecondaryTextColor() colorWithAlphaComponent:0.78];
+    NSColor *timeColor = highlightsOverdue ? [OMCOverdueColor() colorWithAlphaComponent:0.82] : (task.timeText.length > 0 ? (task.done ? [OMCSecondaryTextColor() colorWithAlphaComponent:0.62] : OMCTextColor()) : [OMCSecondaryTextColor() colorWithAlphaComponent:0.78]);
     CGFloat timeFontSize = task.timeText.length > 0 ? 12.5 : 11.5;
     NSTextField *time = [self labelWithText:timeDisplay
                                       frame:NSMakeRect(timeX, y + 10, timeWidth, 18)
@@ -2519,6 +3130,11 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     time.alignment = NSTextAlignmentRight;
     time.menu = taskMenu;
     [view addSubview:time];
+
+    OMCTaskDragView *dragView = [[OMCTaskDragView alloc] initWithFrame:NSMakeRect(textX - 2, y + 3, OMCWidth - textX - 8, 48)];
+    dragView.task = task;
+    dragView.menu = taskMenu;
+    [view addSubview:dragView];
 }
 
 - (NSMenu *)taskContextMenuForTask:(OMCTask *)task {
@@ -2572,11 +3188,36 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 
     cursor += 56;
     [self addFieldLabel:@"任务强调色" root:root y:cursor];
-    self.accentColorWell = [[NSColorWell alloc] initWithFrame:NSMakeRect(18, cursor + 19, 54, 28)];
+    self.accentColorWell = [[OMCRoundColorWell alloc] initWithFrame:NSMakeRect(18, cursor + 17, 34, 34)];
     self.accentColorWell.color = OMCColorFromHex(self.config.accentHexColor, OMCTaskTintColor());
     [root addSubview:self.accentColorWell];
 
-    cursor += 54;
+    cursor += 56;
+    [self addFieldLabel:@"任务圆点阈值" root:root y:cursor];
+    NSArray<NSTextField *> *dotFields = @[
+        [[NSTextField alloc] initWithFrame:NSMakeRect(18, cursor + 20, 42, 25)],
+        [[NSTextField alloc] initWithFrame:NSMakeRect(104, cursor + 20, 42, 25)],
+        [[NSTextField alloc] initWithFrame:NSMakeRect(190, cursor + 20, 42, 25)]
+    ];
+    NSArray<NSString *> *dotLabels = @[@"1点", @"2点", @"3点"];
+    NSArray<NSNumber *> *dotValues = @[@(self.config.dotThresholdOne), @(self.config.dotThresholdTwo), @(self.config.dotThresholdThree)];
+    for (NSUInteger index = 0; index < dotFields.count; index++) {
+        NSTextField *field = dotFields[index];
+        field.stringValue = [NSString stringWithFormat:@"%ld", (long)dotValues[index].integerValue];
+        field.alignment = NSTextAlignmentCenter;
+        [root addSubview:field];
+
+        NSTextField *label = [self labelWithText:dotLabels[index]
+                                           frame:NSMakeRect(NSMaxX(field.frame) + 6, cursor + 25, 34, 15)
+                                            font:[NSFont systemFontOfSize:10.5 weight:NSFontWeightSemibold]
+                                           color:OMCSecondaryTextColor()];
+        [root addSubview:label];
+    }
+    self.dotOneField = dotFields[0];
+    self.dotTwoField = dotFields[1];
+    self.dotThreeField = dotFields[2];
+
+    cursor += 58;
     self.launchAtLoginButton = [[NSButton alloc] initWithFrame:NSMakeRect(18, cursor + 4, OMCWidth - 36, 22)];
     self.launchAtLoginButton.buttonType = NSButtonTypeSwitch;
     self.launchAtLoginButton.title = @"开机自动启动";
@@ -2647,6 +3288,49 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     self.inlineDraftText = @"";
     self.inlineInputActive = NO;
     [self reloadDataAndRender];
+}
+
+- (OMCTask *)taskForIdentifier:(NSString *)identifier {
+    if (identifier.length == 0) {
+        return nil;
+    }
+    for (NSArray<OMCTask *> *tasks in self.tasksByDate.allValues) {
+        for (OMCTask *task in tasks) {
+            if ([task.identifier isEqualToString:identifier]) {
+                return task;
+            }
+        }
+    }
+    return nil;
+}
+
+- (BOOL)dayCell:(OMCDayCell *)cell acceptDraggedTaskIdentifier:(NSString *)identifier {
+    OMCTask *task = [self taskForIdentifier:identifier];
+    if (!task) {
+        self.errorMessage = @"没有找到要移动的任务，请刷新后再试。";
+        [self reloadDataAndRender];
+        return NO;
+    }
+
+    NSDate *targetDate = OMCStartOfDay(cell.date);
+    NSError *error = nil;
+    if (!OMCMoveTaskToDate(self.config, task, targetDate, &error)) {
+        self.errorMessage = error.localizedDescription ?: @"移动任务失败。";
+        [self.taskCache removeAllObjects];
+        [self reloadDataAndRender];
+        return NO;
+    }
+
+    self.selectedDate = targetDate;
+    if (![OMCCalendar() isDate:self.selectedDate equalToDate:self.visibleMonth toUnitGranularity:NSCalendarUnitMonth]) {
+        self.visibleMonth = [self monthStartForDate:self.selectedDate];
+    }
+    self.inlineDraftText = @"";
+    self.inlineInputActive = NO;
+    self.errorMessage = nil;
+    [self.taskCache removeAllObjects];
+    [self reloadDataAndRender];
+    return YES;
 }
 
 - (void)toggleTask:(OMCTaskButton *)sender {
@@ -2827,6 +3511,12 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     }
 }
 
+- (void)controlTextDidBeginEditing:(NSNotification *)notification {
+    if (notification.object == self.inlineTaskInput) {
+        self.inlineInputActive = YES;
+    }
+}
+
 - (void)copySelectedDateTasks:(id)sender {
     NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObject:OMCClipboardDateTitle(self.selectedDate)];
     for (OMCTask *task in [self tasksForDate:self.selectedDate]) {
@@ -2917,26 +3607,47 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
 }
 
 - (void)chooseVault:(id)sender {
+    [self removeOutsideClickMonitor];
+    [self removeKeyboardMonitor];
+
     NSOpenPanel *panel = [NSOpenPanel openPanel];
     panel.canChooseFiles = NO;
     panel.canChooseDirectories = YES;
     panel.allowsMultipleSelection = NO;
     panel.prompt = @"选择主文件夹";
+    panel.directoryURL = self.vaultField.stringValue.length > 0 ? [NSURL fileURLWithPath:self.vaultField.stringValue.stringByExpandingTildeInPath] : nil;
     if ([panel runModal] == NSModalResponseOK) {
-        self.vaultField.stringValue = panel.URL.path ?: @"";
+        NSString *selectedPath = panel.URL.path.stringByStandardizingPath ?: @"";
+        self.vaultField.stringValue = selectedPath;
         [NSApp activateIgnoringOtherApps:YES];
         [self.calendarPanel makeKeyWindow];
+        [self.calendarPanel makeFirstResponder:self.vaultField];
+    }
+
+    if (self.calendarPanel.isVisible) {
+        [self installOutsideClickMonitor];
+        [self installKeyboardMonitor];
     }
 }
 
 - (void)saveSettings:(id)sender {
     OMCConfig *config = [[OMCConfig alloc] init];
-    config.vaultPath = self.vaultField.stringValue ?: @"";
+    NSString *vaultPath = [self.vaultField.stringValue stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    config.vaultPath = vaultPath.length > 0 ? vaultPath.stringByExpandingTildeInPath.stringByStandardizingPath : @"";
     config.dailyFolder = self.folderField.stringValue ?: @"";
     config.dateFormat = self.formatField.stringValue.length > 0 ? self.formatField.stringValue : @"yyyy-MM-dd";
     config.accentHexColor = OMCHexFromColor(self.accentColorWell.color);
     NSInteger lookAhead = self.lookAheadField.integerValue;
     config.lookAheadDays = lookAhead > 0 ? lookAhead : 14;
+    NSInteger dotOne = self.dotOneField.integerValue;
+    NSInteger dotTwo = self.dotTwoField.integerValue;
+    NSInteger dotThree = self.dotThreeField.integerValue;
+    dotOne = dotOne > 0 ? dotOne : 1;
+    dotTwo = dotTwo > dotOne ? dotTwo : dotOne + 1;
+    dotThree = dotThree > dotTwo ? dotThree : dotTwo + 1;
+    config.dotThresholdOne = dotOne;
+    config.dotThresholdTwo = dotTwo;
+    config.dotThresholdThree = dotThree;
 
     NSError *loginError = nil;
     BOOL wantsLaunchAtLogin = self.launchAtLoginButton.state == NSControlStateValueOn;
@@ -2947,10 +3658,10 @@ static NSArray<OMCTask *> *OMCSortedTasks(NSArray<OMCTask *> *tasks) {
     OMCClearResolvedDailyNotesPathCache();
     [self.taskCache removeAllObjects];
     self.showingSettings = NO;
+    self.errorMessage = nil;
     [self reloadDataAndRender];
     if (!loginSaved) {
         self.errorMessage = [NSString stringWithFormat:@"开机启动设置失败：%@", loginError.localizedDescription ?: @"未知错误"];
-        self.showingSettings = YES;
         [self renderPopoverContent];
     }
 }
@@ -3110,6 +3821,32 @@ static int OMCRunSelfTest(void) {
         return 1;
     }
 
+    if (!OMCAppendTaskToDailyNote(config, date, @"拖动测试 12:00", &error)) {
+        fprintf(stderr, "Drag seed append failed: %s\n", error.localizedDescription.UTF8String);
+        return 1;
+    }
+    NSArray<OMCTask *> *dragSeedTasks = OMCLoadTasksForDate(config, date, watched, &error);
+    OMCTask *dragSeedTask = nil;
+    for (OMCTask *candidate in dragSeedTasks) {
+        if ([candidate.title isEqualToString:@"拖动测试"]) {
+            dragSeedTask = candidate;
+            break;
+        }
+    }
+    NSDate *moveDate = [OMCCalendar() dateByAddingUnit:NSCalendarUnitDay value:2 toDate:date options:0];
+    if (!dragSeedTask || !OMCMoveTaskToDate(config, dragSeedTask, moveDate, &error)) {
+        fprintf(stderr, "Daily task move failed: %s\n", error.localizedDescription.UTF8String);
+        return 1;
+    }
+    NSString *movePath = OMCNotePathForDate(config, moveDate);
+    NSString *moveContent = [NSString stringWithContentsOfFile:movePath encoding:NSUTF8StringEncoding error:nil];
+    NSString *sourceAfterMove = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *expectedMovedTask = [NSString stringWithFormat:@"- [ ] 拖动测试 12:00 📅 %@", OMCCanonicalDateKey(moveDate)];
+    if ([sourceAfterMove containsString:@"拖动测试 12:00"] || ![moveContent containsString:expectedMovedTask]) {
+        fprintf(stderr, "Daily task move did not update files.\nSOURCE:\n%s\nTARGET:\n%s\n", (sourceAfterMove ?: @"").UTF8String, (moveContent ?: @"").UTF8String);
+        return 1;
+    }
+
     NSDate *newDate = [OMCCalendar() dateByAddingUnit:NSCalendarUnitDay value:1 toDate:date options:0];
     if (!OMCAppendTaskToDailyNote(config, newDate, @"测试 08:30-09:00", &error)) {
         fprintf(stderr, "Template append failed: %s\n", error.localizedDescription.UTF8String);
@@ -3124,6 +3861,21 @@ static int OMCRunSelfTest(void) {
         ![newContent containsString:@"### 今日感悟"] ||
         ![newContent containsString:expectedTemplateTask]) {
         fprintf(stderr, "Template-created daily note is wrong.\n%s\n", (newContent ?: @"").UTF8String);
+        return 1;
+    }
+    NSString *expectedMonthlyFolder = [[daily stringByAppendingPathComponent:[OMCDateFormatter(@"yyyy") stringFromDate:newDate]] stringByAppendingPathComponent:[OMCDateFormatter(@"yyyy-MM") stringFromDate:newDate]];
+    if (![newPath.stringByDeletingLastPathComponent isEqualToString:expectedMonthlyFolder]) {
+        fprintf(stderr, "New daily note was not created in monthly folder: %s\n", newPath.UTF8String);
+        return 1;
+    }
+
+    NSDate *chineseYearDate = [OMCDateFormatter(@"yyyy-MM-dd") dateFromString:@"2030-07-05"];
+    NSString *chineseYearFolder = [daily stringByAppendingPathComponent:@"2030年"];
+    [NSFileManager.defaultManager createDirectoryAtPath:chineseYearFolder withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *chineseYearPath = OMCNotePathForDate(config, chineseYearDate);
+    NSString *expectedChineseYearFolder = [chineseYearFolder stringByAppendingPathComponent:@"2030-07"];
+    if (![chineseYearPath.stringByDeletingLastPathComponent isEqualToString:expectedChineseYearFolder]) {
+        fprintf(stderr, "Chinese year folder was not preferred: %s\n", chineseYearPath.UTF8String);
         return 1;
     }
 
@@ -3179,6 +3931,16 @@ static int OMCRunSelfTest(void) {
     NSString *scheduleContent = [NSString stringWithContentsOfFile:schedulePath encoding:NSUTF8StringEncoding error:nil];
     if (![scheduleContent containsString:@"- [ ] giffgaff激活 📅 2026-12-17 🔁 every 170 days"]) {
         fprintf(stderr, "Extra recurring writeback failed.\n%s\n", (scheduleContent ?: @"").UTF8String);
+        return 1;
+    }
+    NSDate *extraMoveDate = [OMCDateFormatter(@"yyyy-MM-dd") dateFromString:@"2026-07-01"];
+    if (!OMCMoveTaskToDate(config, extraTask, extraMoveDate, &error)) {
+        fprintf(stderr, "Extra task move failed: %s\n", error.localizedDescription.UTF8String);
+        return 1;
+    }
+    NSString *movedScheduleContent = [NSString stringWithContentsOfFile:schedulePath encoding:NSUTF8StringEncoding error:nil];
+    if (![movedScheduleContent containsString:@"- [ ] giffgaff激活 📅 2026-07-01 🔁 every 170 days"]) {
+        fprintf(stderr, "Extra task move did not replace due date.\n%s\n", (movedScheduleContent ?: @"").UTF8String);
         return 1;
     }
 
